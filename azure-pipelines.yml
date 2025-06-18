@@ -1,0 +1,104 @@
+trigger:
+  branches:
+    include:
+      - main
+
+variables:
+  acrName: 'acreternalpoodle91'
+  imageTag: '$(Build.BuildId)'
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+stages:
+- stage: BuildAndPush
+  displayName: Build and Push Images
+  jobs:
+  - job: Build
+    steps:
+    - task: AzureCLI@2
+      inputs:
+        azureSubscription: 'AzureStudentConnection'
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
+          echo "ACR Name: $acrName"
+          echo "Image Tag: $imageTag"
+          az acr login --name acreternalpoodle91
+
+          services=(order-service product-service store-admin store-front)
+          for service in "${services[@]}"
+          do
+            echo "Building $service"
+            docker build -t ${acrName}.azurecr.io/aks-store-demo/$service:$imageTag ./src/$service
+            docker push ${acrName}.azurecr.io/aks-store-demo/$service:$imageTag
+          done
+      env:
+        acrName: $(acrName)
+        imageTag: $(imageTag)
+
+- stage: Deploy
+  displayName: Deploy to AKS
+  dependsOn: BuildAndPush
+  jobs:
+  - job: Deploy
+    steps:
+    - task: AzureCLI@2
+      displayName: Deploy Helm Chart
+      inputs:
+        azureSubscription: 'AzureStudentConnection'
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
+          echo "Importing AKS credentials..."
+          az aks get-credentials --resource-group rg-aks-store-demo-1 --name aks-eternalpoodle91 --admin --overwrite-existing
+
+          echo "Waiting for AKS API server to become reachable..."
+          for i in {1..10}; do
+            echo "Attempt $i: Checking API server"
+            if kubectl cluster-info; then
+              echo "AKS API server is reachable."
+              break
+            fi
+            echo "API server not reachable yet. Sleeping for 15 seconds..."
+            sleep 15
+          done
+
+          echo "Cleaning up previous Helm release and namespace if they exist..."
+          helm uninstall aks-store-demo --namespace pets || echo "Helm release not found."
+          kubectl delete namespace pets --ignore-not-found
+
+          echo "Listing current directory:"
+          pwd
+          echo "Top-level contents:"
+          ls -la
+          echo "Contents of ./charts:"
+          ls -la ./charts || echo "./charts not found"
+          echo "Contents of ./charts/aks-store-demo:"
+          ls -la ./charts/aks-store-demo || echo "./charts/aks-store-demo not found"
+
+          echo "Deploying Helm chart..."
+          helm upgrade --install aks-store-demo "$SYSTEM_DEFAULTWORKINGDIRECTORY/charts/aks-store-demo" \
+            --namespace pets --create-namespace \
+            --set orderService.image.tag=$imageTag \
+            --set productService.image.tag=$imageTag \
+            --set storeAdmin.image.tag=$imageTag \
+            --set storeFront.image.tag=$imageTag \
+            --set global.image.repository=${acrName}.azurecr.io/aks-store-demo
+      env:
+        acrName: $(acrName)
+        imageTag: $(imageTag)
+      workingDirectory: $(System.DefaultWorkingDirectory)
+
+    - task: AzureCLI@2
+      displayName: Rollback on Failure
+      condition: failed()
+      inputs:
+        azureSubscription: 'AzureStudentConnection'
+        scriptType: 'bash'
+        scriptLocation: 'inlineScript'
+        inlineScript: |
+          echo "Deployment failed — attempting Helm rollback to previous revision..."
+          helm rollback aks-store-demo 1 --namespace pets || echo "Rollback failed or no revision to roll back to."
+      env:
+        acrName: $(acrName)
